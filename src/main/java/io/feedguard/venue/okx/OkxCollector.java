@@ -149,8 +149,10 @@ public final class OkxCollector implements AutoCloseable {
 
     /**
      * Returns the checksum to verify, or null when there is nothing meaningful to check.
-     * Observed live (Oct 2026): OKX "books" sends {@code "checksum":0} on every message. A real
-     * CRC32 equals 0 with probability 2^-32, so 0 is treated as "not provided".
+     * OKX deprecated the field on books / books-l2-tbt / books50-l2-tbt (production: 23 June 2026):
+     * it is still sent but always 0, and seqId/prevSeqId must be used instead. A genuine CRC32
+     * equals 0 with probability 2^-32, so 0 is treated as "not provided".
+     * https://www.okx.com/en-gb/help/okx-order-book-channels-checksum-field-deprecation
      */
     private Integer readChecksum(SymbolState st, Map<String, Object> d) {
         if (!st.checksumEnabled || !Json.has(d, "checksum")) {
@@ -161,7 +163,7 @@ public final class OkxCollector implements AutoCloseable {
             if (!st.checksumZeroReported) {
                 st.checksumZeroReported = true;
                 bus.emit(Venue.OKX, st.instId, IncidentType.CHECKSUM_UNAVAILABLE, Severity.INFO,
-                        "venue sends checksum=0; book integrity relies on seqId chaining only");
+                        "venue sends checksum=0 (deprecated by OKX); book integrity relies on seqId chaining only");
             }
             return null;
         }

@@ -21,7 +21,7 @@ order book wrong until you notice — and your strategy keeps trading on it.
 |---|---|---|
 | `SEQUENCE_GAP` | first update id `U` ≠ previous `u` + 1 on a live book | `prevSeqId` ≠ previous `seqId` |
 | `CHECKSUM_MISMATCH` | — (Binance publishes no checksum) | CRC32 of top 25 levels ≠ venue checksum |
-| `CHECKSUM_UNAVAILABLE` | — | venue sends `checksum: 0`; integrity relies on `seqId` only (reported once) |
+| `CHECKSUM_UNAVAILABLE` | — | venue sends `checksum: 0` ([deprecated by OKX](https://www.okx.com/en-gb/help/okx-order-book-channels-checksum-field-deprecation) since 23 June 2026); integrity relies on `seqId` only (reported once) |
 | `CROSSED_BOOK` / `BOOK_UNCROSSED` | best bid ≥ best ask on a synced book | same |
 | `STALE_FEED` / `FEED_RECOVERED` | no message for longer than the threshold, even with the socket open | same |
 | `SCHEMA_DRIFT` | fields added or removed vs. the first message seen | same, per action |
@@ -92,8 +92,10 @@ crossed books and schema changes.
 
 - The JSON parser allocates a tree per message: fine for a monitoring probe, not for a hot path.
 - Binance REST snapshots use `limit=1000`, which has a request weight; keep symbol counts modest.
-- Neither venue currently provides a usable book checksum, so silently wrong book *content* with
-  valid sequence ids is not yet detected. Periodic REST reconciliation is the next detector.
+- Neither venue currently provides a usable book checksum (OKX deprecated it in June 2026 and
+  recommends `seqId`/`prevSeqId` instead). Sequence ids prove nothing was lost on the wire, but
+  not that the book was applied correctly on your side; that used to be the checksum's job.
+  Periodic REST reconciliation is the next detector to close that gap.
 
 ## Roadmap
 

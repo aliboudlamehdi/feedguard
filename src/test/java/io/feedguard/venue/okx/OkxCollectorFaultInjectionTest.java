@@ -117,7 +117,7 @@ class OkxCollectorFaultInjectionTest {
 
     @Test
     void zeroChecksumMeansNotProvidedAndIsReportedOnce() {
-        // Live OKX behaviour observed in Oct 2026: "checksum":0 on every message.
+        // OKX deprecated the checksum (June 2026): always "checksum":0.
         collector.handleMessage(snapshot(10, 0));
         collector.handleMessage(bidUpdate(11, 10, "60000.0", "2", 0));
         collector.handleMessage(bidUpdate(12, 11, "59999.0", "1", 0));
