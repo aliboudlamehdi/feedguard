@@ -1,5 +1,6 @@
 package io.feedguard.venue.binance;
 
+import io.feedguard.book.BookTop;
 import io.feedguard.book.OrderBook;
 
 import java.util.ArrayDeque;
@@ -130,6 +131,11 @@ public final class BinanceDepthSync {
 
     public synchronized boolean isCrossed() {
         return isLive() && book.isCrossed();
+    }
+
+    /** Copy of the top levels tagged with the last applied update id. */
+    public synchronized BookTop top(int depth) {
+        return BookTop.of(book, depth, lastUpdateId);
     }
 
     public synchronized String topOfBook() {

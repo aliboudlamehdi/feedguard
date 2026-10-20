@@ -26,6 +26,7 @@ class OkxCollectorFaultInjectionTest {
     private RecordingSink sink;
     private ScheduledExecutorService scheduler;
     private OkxCollector collector;
+    private Monitors monitors;
     private final List<String> sent = new ArrayList<>();
     /** Mirror of what the venue's book should be, used to produce correct checksums. */
     private final OrderBook venueBook = new OrderBook();
@@ -36,8 +37,8 @@ class OkxCollectorFaultInjectionTest {
         IncidentBus bus = new IncidentBus(Clock.systemUTC());
         bus.addSink(sink);
         scheduler = Executors.newSingleThreadScheduledExecutor();
-        collector = new OkxCollector(List.of("BTC-USDT"), new Monitors(bus, System::nanoTime),
-                Duration.ofSeconds(5), scheduler);
+        monitors = new Monitors(bus, System::nanoTime);
+        collector = new OkxCollector(List.of("BTC-USDT"), monitors, Duration.ofSeconds(5), scheduler);
         collector.onConnected(sent::add);
     }
 
@@ -127,6 +128,66 @@ class OkxCollectorFaultInjectionTest {
         // sequence checking still works without checksums
         collector.handleMessage(bidUpdate(15, 14, "59998.0", "1", 0));
         assertEquals(IncidentType.SEQUENCE_GAP, sink.last().type());
+    }
+
+    /** Snapshot message reflecting the current venue book. */
+    private String venueSnapshot(long seqId) {
+        return msg("snapshot", seqId, -1, levelsJson(venueBook.topBids(400)), levelsJson(venueBook.topAsks(400)), 0);
+    }
+
+    private static String levelsJson(List<OrderBook.Level> levels) {
+        StringBuilder sb = new StringBuilder("[");
+        for (OrderBook.Level l : levels) {
+            if (sb.length() > 1) {
+                sb.append(',');
+            }
+            sb.append("[\"").append(l.rawPrice()).append("\",\"").append(l.rawSize()).append("\",\"0\",\"1\"]");
+        }
+        return sb.append(']').toString();
+    }
+
+    @Test
+    void reconciliationOverShadowSubscriptionVerifiesHealthyBook() {
+        List<List<String>> opened = new ArrayList<>();
+        boolean[] closed = {false};
+        OkxCollector c = new OkxCollector(List.of("BTC-USDT"), monitors, Duration.ofSeconds(5), scheduler,
+                (ids, onMessage) -> {
+                    opened.add(ids);
+                    return () -> closed[0] = true;
+                });
+        c.onConnected(sent::add);
+        c.handleMessage(snapshot(10, null));
+        c.reconcileAll();
+        assertEquals(List.of(List.of("BTC-USDT")), opened);
+
+        c.handleMessage(bidUpdate(11, 10, "60000.0", "2", null)); // live at seqId 11
+        c.handleShadowMessage(venueSnapshot(11));                  // reference snapshot at seqId 11
+
+        assertEquals(1, monitors.reconciler(io.feedguard.core.Venue.OKX, "BTC-USDT").matches());
+        assertTrue(closed[0], "shadow connection closed once all rounds are done");
+        assertTrue(sink.types().stream().noneMatch(t -> t == IncidentType.BOOK_MISMATCH));
+    }
+
+    @Test
+    void reconciliationCatchesSilentlyWrongBook() {
+        OkxCollector c = new OkxCollector(List.of("BTC-USDT"), monitors, Duration.ofSeconds(5), scheduler,
+                (ids, onMessage) -> () -> { });
+        c.onConnected(sent::add);
+        c.handleMessage(snapshot(10, null));
+        c.liveSync("BTC-USDT").book().apply(OrderBook.Side.ASK, "60000.5", "3"); // phantom level
+        c.reconcileAll();
+        sent.clear();
+
+        c.handleShadowMessage(venueSnapshot(10)); // reference first this time
+        // checksum 0, as OKX sends since June 2026: the checksum can no longer catch this
+        String update = bidUpdate(11, 10, "60000.0", "2", 0);
+        c.handleMessage(update);
+        c.handleShadowMessage(update); // both connections receive the same push
+
+        var mismatch = sink.lastOf(IncidentType.BOOK_MISMATCH);
+        assertTrue(mismatch.detail().contains("extra in live book 60000.5x3"), mismatch.detail());
+        assertEquals(2, sent.size(), "live book resubscribed");
+        assertEquals(1, monitors.reconciler(io.feedguard.core.Venue.OKX, "BTC-USDT").mismatches());
     }
 
     @Test

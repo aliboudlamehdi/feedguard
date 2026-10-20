@@ -6,6 +6,7 @@ import io.feedguard.core.Severity;
 import io.feedguard.core.Venue;
 import io.feedguard.detect.LatencyStats;
 import io.feedguard.detect.Monitors;
+import io.feedguard.detect.Reconciler;
 import io.feedguard.detect.StalenessMonitor;
 import io.feedguard.json.Json;
 import io.feedguard.ws.ResilientWebSocket;
@@ -40,6 +41,7 @@ public final class BinanceCollector implements AutoCloseable {
     static final String REST_DEPTH = "https://api.binance.com/api/v3/depth?limit=1000&symbol=";
     private static final long TOO_OLD_RETRY_MS = 250;
     private static final long FAILED_RETRY_MS = 2_000;
+    static final int RECONCILE_DEPTH = 20;
 
     private final class SymbolState {
         final String symbol;
@@ -47,13 +49,17 @@ public final class BinanceCollector implements AutoCloseable {
         final AtomicBoolean fetching = new AtomicBoolean();
         final StalenessMonitor.Handle stale;
         final LatencyStats latency;
+        final Reconciler reconciler;
         boolean crossed;            // guarded by this
         volatile long incidentAtNanos; // 0 = no pending resync after a gap
+        /** Reference book rebuilt from a fresh REST snapshot during a reconciliation round. */
+        volatile BinanceDepthSync shadow;
 
         SymbolState(String symbol, Duration staleThreshold) {
             this.symbol = symbol;
             this.stale = monitors.staleness().register(Venue.BINANCE, symbol, staleThreshold);
             this.latency = monitors.latency(Venue.BINANCE, symbol);
+            this.reconciler = monitors.reconciler(Venue.BINANCE, symbol);
         }
     }
 
@@ -105,6 +111,9 @@ public final class BinanceCollector implements AutoCloseable {
     /** On every (re)connection: drop books and resync from fresh snapshots. */
     void onConnected() {
         for (SymbolState st : states.values()) {
+            if (st.shadow != null) {
+                abortReconciliation(st);
+            }
             st.sync.reset();
             synchronized (st) {
                 st.crossed = false;
@@ -138,7 +147,9 @@ public final class BinanceCollector implements AutoCloseable {
                 Json.lng(data, "U", -1), Json.lng(data, "u", -1), eventTime,
                 Json.levels(Json.arr(data, "b")), Json.levels(Json.arr(data, "a")));
 
-        switch (st.sync.onEvent(ev)) {
+        BinanceDepthSync.Result result = st.sync.onEvent(ev);
+        reconcileStep(st, ev, result);
+        switch (result) {
             case APPLIED -> checkCrossed(st);
             case GAP -> onGap(st);
             case SNAPSHOT_TOO_OLD -> requestSnapshot(st, TOO_OLD_RETRY_MS);
@@ -147,6 +158,105 @@ public final class BinanceCollector implements AutoCloseable {
             }
         }
     }
+
+    // ---------------------------------------------------------------- reconciliation
+
+    /**
+     * Starts a reconciliation round on every live book: a reference book is rebuilt from a fresh
+     * REST snapshot plus the same stream events, then compared with the live book once both sit
+     * at the same update id. Proves the live book content, not just its sequence continuity.
+     */
+    public void reconcileAll() {
+        for (SymbolState st : states.values()) {
+            startReconciliation(st);
+        }
+    }
+
+    /** Expires rounds that could not reach a common update id in time. Call periodically. */
+    public void tick() {
+        for (SymbolState st : states.values()) {
+            if (st.reconciler.expireIfDue()) {
+                st.shadow = null;
+            }
+        }
+    }
+
+    private void startReconciliation(SymbolState st) {
+        if (!st.sync.isLive() || !st.reconciler.begin()) {
+            return;
+        }
+        BinanceDepthSync shadow = new BinanceDepthSync();
+        st.shadow = shadow;
+        CompletableFuture<Snapshot> f;
+        try {
+            f = snapshots.fetch(st.symbol);
+        } catch (RuntimeException e) {
+            f = CompletableFuture.failedFuture(e);
+        }
+        f.whenComplete((snap, err) -> {
+            if (st.shadow != shadow) {
+                return; // round already ended
+            }
+            if (err != null) {
+                abortReconciliation(st);
+                return;
+            }
+            BinanceDepthSync.Result r = shadow.onSnapshot(snap.lastUpdateId(), snap.bids(), snap.asks());
+            if (r == BinanceDepthSync.Result.SNAPSHOT_TOO_OLD || r == BinanceDepthSync.Result.GAP) {
+                abortReconciliation(st);
+            }
+        });
+    }
+
+    private void reconcileStep(SymbolState st, BinanceDepthSync.DepthEvent ev, BinanceDepthSync.Result live) {
+        BinanceDepthSync shadow = st.shadow;
+        if (shadow == null) {
+            return;
+        }
+        if (live != BinanceDepthSync.Result.APPLIED && live != BinanceDepthSync.Result.STALE_DROPPED) {
+            abortReconciliation(st); // live book is resyncing: nothing meaningful to compare
+            return;
+        }
+        BinanceDepthSync.Result ref = shadow.onEvent(ev);
+        if (ref == BinanceDepthSync.Result.GAP || ref == BinanceDepthSync.Result.SNAPSHOT_TOO_OLD) {
+            abortReconciliation(st);
+            return;
+        }
+        long liveId = st.sync.lastUpdateId();
+        if (shadow.isLive() && shadow.lastUpdateId() == liveId) {
+            st.reconciler.offer(Reconciler.Side.LIVE, st.sync.top(RECONCILE_DEPTH));
+            Reconciler.Outcome o = st.reconciler.offer(Reconciler.Side.REFERENCE, shadow.top(RECONCILE_DEPTH));
+            st.shadow = null;
+            if (o != null && !o.match()) {
+                onMismatch(st, o);
+            }
+        }
+    }
+
+    private void abortReconciliation(SymbolState st) {
+        st.shadow = null;
+        st.reconciler.abort();
+    }
+
+    private void onMismatch(SymbolState st, Reconciler.Outcome o) {
+        bus.emit(Venue.BINANCE, st.symbol, IncidentType.BOOK_MISMATCH, Severity.CRITICAL,
+                "lastUpdateId=" + o.seq() + " " + o.detail() + " - rebuilding book");
+        if (st.incidentAtNanos == 0) {
+            st.incidentAtNanos = System.nanoTime();
+        }
+        st.sync.reset();
+        synchronized (st) {
+            st.crossed = false;
+        }
+        requestSnapshot(st, 0);
+    }
+
+    /** For tests: the live sync of a symbol. */
+    BinanceDepthSync liveSync(String symbol) {
+        return states.get(symbol).sync;
+    }
+
+    // ---------------------------------------------------------------- gaps and snapshots
 
     private void onGap(SymbolState st) {
         BinanceDepthSync.Gap g = st.sync.lastGap();

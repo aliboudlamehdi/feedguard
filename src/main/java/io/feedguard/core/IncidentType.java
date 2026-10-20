@@ -9,6 +9,8 @@ public enum IncidentType {
     CHECKSUM_UNAVAILABLE,
     /** Best bid >= best ask on a synced book. */
     CROSSED_BOOK,
+    /** Live book differs from an independently rebuilt reference book at the same sequence. */
+    BOOK_MISMATCH,
     BOOK_UNCROSSED,
     /** No message on a stream for longer than its threshold. */
     STALE_FEED,

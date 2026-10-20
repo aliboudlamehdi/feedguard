@@ -22,12 +22,25 @@ order book wrong until you notice — and your strategy keeps trading on it.
 | `SEQUENCE_GAP` | first update id `U` ≠ previous `u` + 1 on a live book | `prevSeqId` ≠ previous `seqId` |
 | `CHECKSUM_MISMATCH` | — (Binance publishes no checksum) | CRC32 of top 25 levels ≠ venue checksum |
 | `CHECKSUM_UNAVAILABLE` | — | venue sends `checksum: 0` ([deprecated by OKX](https://www.okx.com/en-gb/help/okx-order-book-channels-checksum-field-deprecation) since 23 June 2026); integrity relies on `seqId` only (reported once) |
+| `BOOK_MISMATCH` | live book ≠ reference rebuilt from a fresh REST snapshot + the same events, at an equal update id | live book ≠ reference from a short-lived second subscription, at an equal `seqId` |
 | `CROSSED_BOOK` / `BOOK_UNCROSSED` | best bid ≥ best ask on a synced book | same |
 | `STALE_FEED` / `FEED_RECOVERED` | no message for longer than the threshold, even with the socket open | same |
 | `SCHEMA_DRIFT` | fields added or removed vs. the first message seen | same, per action |
 | `DISCONNECT` / `RECONNECTED` | socket closed or failed; exponential-backoff reconnect | same |
 | `BOOK_SYNCED` | book (re)built, with resync time after an incident | same |
 | `SNAPSHOT_FAILED`, `VENUE_ERROR`, `PARSE_ERROR` | REST errors, venue error payloads, unreadable messages | same |
+
+### Why reconciliation
+
+Sequence ids prove that nothing was lost on the wire. They do not prove that the book you hold is
+right: an update applied twice, a level not removed, a bug in your book code. A venue checksum
+used to catch that; OKX deprecated its checksum in June 2026 and Binance never had one.
+
+Every `--reconcile-sec` seconds FeedGuard builds an independent reference book and compares the
+top 20 levels with the live book **at exactly the same venue sequence**, so a moving market never
+causes a false alarm. A mismatch raises `BOOK_MISMATCH` and rebuilds the live book. Rounds that
+cannot align within 15 s count as inconclusive, never as incidents. Totals are printed as
+`[recon] ... verified=N mismatch=N inconclusive=N`.
 
 Design notes:
 
@@ -59,6 +72,7 @@ java -jar target/feedguard-0.1.0-SNAPSHOT.jar \
 | `--duration-sec` | `0` (run forever) | stop after N seconds |
 | `--raw-out` | — | also write the first raw messages per venue to this file |
 | `--raw-count` | `200` | raw messages captured per venue |
+| `--reconcile-sec` | `60` | book reconciliation interval, `0` to disable |
 
 Example incident:
 
@@ -92,14 +106,15 @@ crossed books and schema changes.
 
 - The JSON parser allocates a tree per message: fine for a monitoring probe, not for a hot path.
 - Binance REST snapshots use `limit=1000`, which has a request weight; keep symbol counts modest.
-- Neither venue currently provides a usable book checksum (OKX deprecated it in June 2026 and
-  recommends `seqId`/`prevSeqId` instead). Sequence ids prove nothing was lost on the wire, but
-  not that the book was applied correctly on your side; that used to be the checksum's job.
-  Periodic REST reconciliation is the next detector to close that gap.
+- Binance snapshots hold 1000 levels per side. If price drifts far enough, a resting level that
+  was beyond that depth at the live book's last rebuild and never updated since can be missing
+  from the live book but present in the reference: a `BOOK_MISMATCH` of the "missing in live
+  book" kind. It is a real gap in the local book, but one inherent to Binance's protocol rather
+  than a feed fault; the detail line tells the kinds apart.
+- Each Binance reconciliation round costs one REST depth request per symbol.
 
 ## Roadmap
 
-- Periodic book reconciliation against REST snapshots
 - Bybit, Coinbase, Kraken (CRC32 checksum), Hyperliquid
 - Cross-venue divergence (mid vs. median of other venues)
 - Adaptive staleness thresholds per symbol and time of day

@@ -1,5 +1,6 @@
 package io.feedguard.venue.okx;
 
+import io.feedguard.book.BookTop;
 import io.feedguard.book.OrderBook;
 
 import java.nio.charset.StandardCharsets;
@@ -110,6 +111,11 @@ public final class OkxBookSync {
 
     public synchronized boolean isCrossed() {
         return synced && book.isCrossed();
+    }
+
+    /** Copy of the top levels tagged with the last applied seqId. */
+    public synchronized BookTop top(int depth) {
+        return BookTop.of(book, depth, lastSeqId);
     }
 
     public synchronized String topOfBook() {

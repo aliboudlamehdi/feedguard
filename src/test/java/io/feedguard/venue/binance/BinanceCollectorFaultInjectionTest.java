@@ -28,13 +28,14 @@ class BinanceCollectorFaultInjectionTest {
     private ScheduledExecutorService scheduler;
     private final Deque<BinanceCollector.Snapshot> snapshots = new ArrayDeque<>();
     private BinanceCollector collector;
+    private Monitors monitors;
 
     @BeforeEach
     void setUp() {
         sink = new RecordingSink();
         IncidentBus bus = new IncidentBus(Clock.systemUTC());
         bus.addSink(sink);
-        Monitors monitors = new Monitors(bus, System::nanoTime);
+        monitors = new Monitors(bus, System::nanoTime);
         scheduler = Executors.newSingleThreadScheduledExecutor();
         BinanceCollector.SnapshotSource source = symbol -> {
             BinanceCollector.Snapshot s = snapshots.pollFirst();
@@ -116,6 +117,56 @@ class BinanceCollectorFaultInjectionTest {
         collector.onConnected(); // no snapshot queued -> failure
         assertEquals(IncidentType.SNAPSHOT_FAILED, sink.last().type());
         assertTrue(sink.last().detail().contains("no snapshot queued"), sink.last().detail());
+    }
+
+    @Test
+    void reconciliationVerifiesAHealthyBook() {
+        snapshots.add(snap(100));
+        collector.onConnected();
+        collector.handleMessage(depth(101, 101, "[]", "[]"));
+        collector.handleMessage(depth(102, 103, "[]", "[]"));
+
+        snapshots.add(snap(103)); // fresh REST snapshot for the reference book
+        collector.reconcileAll();
+        collector.handleMessage(depth(104, 105, "[]", "[]"));
+
+        assertEquals(List.of(IncidentType.BOOK_SYNCED), sink.types());
+        assertEquals(1, monitors.reconciler(io.feedguard.core.Venue.BINANCE, "BTCUSDT").matches());
+    }
+
+    @Test
+    void reconciliationCatchesSilentlyWrongBookAndRebuildsIt() {
+        snapshots.add(snap(100));
+        collector.onConnected();
+        collector.handleMessage(depth(101, 101, "[]", "[]"));
+        collector.handleMessage(depth(102, 103, "[]", "[]"));
+
+        // Sequence ids are perfect, but the live book content is wrong (e.g. an update was
+        // mis-applied by the consumer). No gap detector can see this.
+        collector.liveSync("BTCUSDT").book().apply(io.feedguard.book.OrderBook.Side.BID, "60000.00", "9");
+
+        snapshots.add(snap(103));
+        collector.reconcileAll();
+        snapshots.add(snap(110)); // used by the rebuild after the mismatch
+        collector.handleMessage(depth(104, 105, "[]", "[]"));
+
+        assertEquals(List.of(IncidentType.BOOK_SYNCED, IncidentType.BOOK_MISMATCH, IncidentType.BOOK_SYNCED),
+                sink.types());
+        var mismatch = sink.lastOf(IncidentType.BOOK_MISMATCH);
+        assertEquals(Severity.CRITICAL, mismatch.severity());
+        assertTrue(mismatch.detail().contains("size at 60000.00 live=9 reference=1.5"), mismatch.detail());
+        assertEquals(1, monitors.reconciler(io.feedguard.core.Venue.BINANCE, "BTCUSDT").mismatches());
+    }
+
+    @Test
+    void reconciliationIsInconclusiveWhenSnapshotFails() {
+        snapshots.add(snap(100));
+        collector.onConnected();
+        collector.handleMessage(depth(101, 101, "[]", "[]"));
+        collector.reconcileAll(); // nothing queued -> fetch fails
+        collector.handleMessage(depth(102, 102, "[]", "[]"));
+        assertEquals(List.of(IncidentType.BOOK_SYNCED), sink.types(), "no false alarm");
+        assertEquals(1, monitors.reconciler(io.feedguard.core.Venue.BINANCE, "BTCUSDT").inconclusive());
     }
 
     @Test

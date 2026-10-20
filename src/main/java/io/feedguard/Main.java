@@ -6,6 +6,7 @@ import io.feedguard.core.JsonlFileSink;
 import io.feedguard.core.RawCapture;
 import io.feedguard.detect.LatencyStats;
 import io.feedguard.detect.Monitors;
+import io.feedguard.detect.Reconciler;
 import io.feedguard.venue.binance.BinanceCollector;
 import io.feedguard.venue.okx.OkxCollector;
 
@@ -28,7 +29,7 @@ import java.util.concurrent.TimeUnit;
  * <pre>
  * java -jar feedguard.jar [--binance BTCUSDT,ETHUSDT|none] [--okx BTC-USDT,ETH-USDT|none]
  *                         [--stale-ms 5000] [--stats-sec 60] [--out incidents.jsonl] [--duration-sec 0]
- *                         [--raw-out raw.log] [--raw-count 200]
+ *                         [--raw-out raw.log] [--raw-count 200] [--reconcile-sec 60]
  * </pre>
  */
 public final class Main {
@@ -41,6 +42,7 @@ public final class Main {
         long statsSec = Long.parseLong(opts.getOrDefault("stats-sec", "60"));
         Path out = Path.of(opts.getOrDefault("out", "incidents.jsonl"));
         long durationSec = Long.parseLong(opts.getOrDefault("duration-sec", "0"));
+        long reconcileSec = Long.parseLong(opts.getOrDefault("reconcile-sec", "60"));
 
         IncidentBus bus = new IncidentBus(Clock.systemUTC());
         bus.addSink(new ConsoleSink());
@@ -68,8 +70,9 @@ public final class Main {
         OkxCollector okx = okxSymbols.isEmpty() ? null
                 : new OkxCollector(okxSymbols, monitors, stale, scheduler);
 
-        System.out.printf("FeedGuard probe - binance=%s okx=%s stale=%dms stats=%ds incidents=%s%n",
-                binanceSymbols, okxSymbols, stale.toMillis(), statsSec, out.toAbsolutePath());
+        System.out.printf("FeedGuard probe - binance=%s okx=%s stale=%dms stats=%ds reconcile=%s incidents=%s%n",
+                binanceSymbols, okxSymbols, stale.toMillis(), statsSec,
+                reconcileSec > 0 ? reconcileSec + "s" : "off", out.toAbsolutePath());
 
         if (binance != null) {
             binance.start(http);
@@ -79,6 +82,24 @@ public final class Main {
         }
         scheduler.scheduleAtFixedRate(monitors.staleness()::check, 1, 1, TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(() -> printStats(monitors), statsSec, statsSec, TimeUnit.SECONDS);
+        if (reconcileSec > 0) {
+            scheduler.scheduleAtFixedRate(() -> {
+                if (binance != null) {
+                    binance.reconcileAll();
+                }
+                if (okx != null) {
+                    okx.reconcileAll();
+                }
+            }, reconcileSec, reconcileSec, TimeUnit.SECONDS);
+            scheduler.scheduleAtFixedRate(() -> {
+                if (binance != null) {
+                    binance.tick();
+                }
+                if (okx != null) {
+                    okx.tick();
+                }
+            }, 1, 1, TimeUnit.SECONDS);
+        }
 
         CountDownLatch done = new CountDownLatch(1);
         Thread shutdown = new Thread(() -> {
@@ -120,6 +141,9 @@ public final class Main {
             System.out.printf("[stats] %-20s msgs=%-6d lag p50=%dms p99=%dms max=%dms%s%n",
                     e.getKey(), s.count(), s.p50(), s.p99(), s.max(),
                     s.negativeCount() > 0 ? " (negative=" + s.negativeCount() + ": check clock sync)" : "");
+        }
+        for (Map.Entry<String, Reconciler> e : monitors.allReconcilers().entrySet()) {
+            System.out.printf("[recon] %-20s %s%n", e.getKey(), e.getValue().summary());
         }
     }
 
